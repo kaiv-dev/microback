@@ -25,7 +25,7 @@ TEMPLATE_CONTENT = """# ========================================================
 
 # --- Global Defaults (inherited by all tasks if not overridden) ---
 format = "dir"            # "dir" (incremental via hardlinks) or "tar.zst"
-verify = null             # null (always keep), "not_empty", or "min_size: 1M"
+verify = "none"           # "none" (always keep), "not_empty", or "min_size: 1M"
 keep_count = 7            # number of snapshots to keep
 destination = "/big/backups" # base destination folder
 
@@ -37,7 +37,7 @@ destination = "/big/backups" # base destination folder
 destination = "/big/backups/pokemon"
 schedule = "03:00"        # daily time (HH:MM) or "every Nh" (e.g. "every 6h")
 keep_count = 7
-verify = null
+verify = "none"
 
 # Rules syntax: "<src_pattern> -> <dest_subfolder>"
 rules = [
@@ -69,11 +69,8 @@ def parse_config_file(path: Path):
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Allow users to write 'null' comfortably (translate '= null' to '= "none"')
-    content_clean = re.sub(r'=\s*null\b', '= "none"', content)
-
     try:
-        data = tomllib.loads(content_clean)
+        data = tomllib.loads(content)
     except tomllib.TOMLDecodeError as e:
         raise ValueError(f"TOML Syntax Error in {path}: {e}")
 

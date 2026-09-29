@@ -3,7 +3,7 @@
 destination = "/big/backups"
 keep_count = 7
 format = "dir"        # "dir" (uses rsync hardlinks), "tar.zst", or "tar.gz"
-verify = null         # null / "none", "size>10M", or "cmd:test -f marker.txt"
+verify = "none"       # "none", "size>10M", or "cmd:test -f marker.txt"
 schedule = "03:00"    # Run daily at 03:00 (also supports "1d", "12h", "60m", cron syntax)
 
 [minecraft_pokemon]
@@ -11,7 +11,7 @@ destination = "/big/backups/pokemon"
 keep_count = 14
 schedule = "04:00"
 format = "dir"
-verify = null
+verify = "none"
 
 # Backup rules: "<source mask/path> -> <destination subfolder>"
 # (space-separated "<source> <destination>" is also supported)

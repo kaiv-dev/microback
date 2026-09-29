@@ -1,4 +1,9 @@
-# microback 🗃️
+
+
+# microback 
+<a href="https://gemini.google.com/">
+    <img src="https://img.shields.io/badge/Built%20with-Gemini%20AI-8E75FF?style=for-the-badge&logo=googlegemini&logoColor=white" alt="Made with" />
+</a>
 
 Minimalist, zero-dependency local backup manager inspired by `microsocks` simplicity and `caddy`-style ergonomics.
 
@@ -57,7 +62,7 @@ Example (`/etc/microback/configs/pokemon.toml`):
 destination = "/big/backups"
 keep_count = 7
 format = "dir"
-verify = null
+verify = "none"
 schedule = "03:00"
 
 [minecraft_pokemon]
