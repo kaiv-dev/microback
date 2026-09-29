@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""
+microback — Lightweight, zero-dependency backup manager with hardlinks and rotation.
+"""
+
+import sys
+import os
+import glob
+import shutil
+import subprocess
+import argparse
+import datetime
+import tomllib
+import re
+import getpass
+from pathlib import Path
+
+ENABLED_DIR = Path("/etc/microback/enabled.d")
+LOG_DIR = Path("/var/log/microback")
+STATE_DIR = Path("/var/lib/microback")
+
+TEMPLATE_CONTENT = """# =============================================================================
+# microback configuration
+# =============================================================================
+
+# --- Global Defaults (inherited by all tasks if not overridden) ---
+format = "dir"            # "dir" (incremental via hardlinks) or "tar.zst"
+verify = null             # null (always keep), "not_empty", or "min_size: 1M"
+keep_count = 7            # number of snapshots to keep
+destination = "/big/backups" # base destination folder
+
+# =============================================================================
+# Tasks
+# =============================================================================
+
+[minecraft_pokemon]
+destination = "/big/backups/pokemon"
+schedule = "03:00"        # daily time (HH:MM) or "every Nh" (e.g. "every 6h")
+keep_count = 7
+verify = null
+
+# Rules syntax: "<src_pattern> -> <dest_subfolder>"
+rules = [
+    "~/minecraft_pokemon/data/world/playerdata -> playerdata",
+    "~/minecraft_pokemon/data/world/data/pokemon/pc/*.json -> pc",
+    "~/minecraft_pokemon/server.properties -> configs/server.properties",
+]
+
+# Optional hooks:
+# pre_hook = "echo Saving world..."
+# post_hook = "echo Backup finished!"
+"""
+
+def log(msg, error=False):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stream = sys.stderr if error else sys.stdout
+    stream.write(f"[{now}] {msg}\n")
+    stream.flush()
+
+def ensure_dirs():
+    ENABLED_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+def parse_config_file(path: Path):
+    if not path.is_file():
+        raise FileNotFoundError(f"Configuration file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Allow users to write 'null' comfortably (translate '= null' to '= "none"')
+    content_clean = re.sub(r'=\s*null\b', '= "none"', content)
+
+    try:
+        data = tomllib.loads(content_clean)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"TOML Syntax Error in {path}: {e}")
+
+    # Extract globals (root-level scalar keys or [default] / [defaults])
+    globals_dict = {
+        "format": "dir",
+        "verify": None,
+    }
+    defaults_section = data.pop("default", None) or data.pop("defaults", None) or {}
+    if isinstance(defaults_section, dict):
+        globals_dict.update(defaults_section)
+
+    root_keys = [k for k, v in data.items() if not isinstance(v, dict)]
+    for k in root_keys:
+        globals_dict[k] = data.pop(k)
+
+    tasks = {}
+    for task_name, task_conf in data.items():
+        if not isinstance(task_conf, dict):
+            continue
+        merged = dict(globals_dict)
+        merged.update(task_conf)
+        merged["_name"] = task_name
+        merged["_file"] = str(path)
+        tasks[task_name] = merged
+
+    return globals_dict, tasks
+
+def parse_rule_line(line: str):
+    line = line.strip()
+    if "->" in line:
+        src_part, dst_part = line.split("->", 1)
+    else:
+        parts = line.split()
+        src_part = parts[0]
+        dst_part = parts[-1]
+    src = os.path.expandvars(os.path.expanduser(src_part.strip()))
+    dst = dst_part.strip().strip("/")
+    return src, dst
+
+def get_path_prefix(pattern: str) -> Path:
+    p = Path(pattern)
+    parts = p.parts
+    if not parts:
+        return Path(".")
+    prefix = Path(parts[0])
+    for part in parts[1:]:
+        if any(c in part for c in ["*", "?", "["]):
+            break
+        prefix = prefix / part
+    return prefix
+
+def check_permissions(task: dict):
+    errors = []
+    user_str = getpass.getuser()
+
+    # 1. Check destination permissions
+    dest_str = task.get("destination")
+    if dest_str:
+        dest_path = Path(dest_str).expanduser()
+        p = dest_path
+        while not p.exists() and p != p.parent:
+            p = p.parent
+
+        if p.exists():
+            if not os.access(p, os.W_OK):
+                errors.append(f"Destination permission error: Directory '{p}' is not writable by user '{user_str}'")
+            if not os.access(p, os.X_OK):
+                errors.append(f"Destination permission error: Directory '{p}' is not traversable (missing execute bit)")
+
+            if dest_path.exists():
+                if not os.access(dest_path, os.W_OK):
+                    errors.append(f"Destination permission error: Target directory '{dest_path}' is not writable")
+                if not os.access(dest_path, os.X_OK):
+                    errors.append(f"Destination permission error: Target directory '{dest_path}' is not traversable")
+                # Also check existing snapshots for rotation/cleanup permission
+                try:
+                    for item in dest_path.iterdir():
+                        if item.is_dir():
+                            if not os.access(item, os.W_OK | os.X_OK):
+                                errors.append(f"Destination permission error: Existing backup snapshot '{item}' is not writable (rotation may fail)")
+                                break
+                        elif item.is_file():
+                            if not os.access(item, os.W_OK):
+                                errors.append(f"Destination permission error: Existing backup file '{item}' is not writable (rotation may fail)")
+                                break
+                except PermissionError:
+                    errors.append(f"Destination permission error: Cannot list destination directory '{dest_path}'")
+        else:
+            errors.append(f"Destination permission error: Path '{dest_path}' has no accessible parent directory")
+
+    # 2. Check source permissions
+    rules = task.get("rules", [])
+    for r in rules:
+        try:
+            src_pattern, _ = parse_rule_line(r)
+        except Exception:
+            continue
+
+        base_prefix = get_path_prefix(src_pattern)
+        p = base_prefix
+        while not p.exists() and p != p.parent:
+            p = p.parent
+        if p.exists() and not os.access(p, os.R_OK | os.X_OK):
+            errors.append(f"Source permission error: Base path '{p}' is not readable/traversable by user '{user_str}'")
+            continue
+
+        matches = glob.glob(src_pattern, recursive=True)
+        rule_err_count = 0
+        for match in matches:
+            if rule_err_count >= 5:
+                errors.append(f"Source permission error: More unreadable files/dirs found in '{src_pattern}' (truncated)")
+                break
+
+            m_path = Path(match)
+            if not os.access(m_path, os.R_OK):
+                errors.append(f"Source permission error: '{m_path}' is not readable")
+                rule_err_count += 1
+                continue
+
+            if m_path.is_dir():
+                if not os.access(m_path, os.X_OK):
+                    errors.append(f"Source permission error: Directory '{m_path}' is not traversable")
+                    rule_err_count += 1
+                    continue
+
+                for root, dirs, files in os.walk(m_path):
+                    if rule_err_count >= 5:
+                        break
+                    r_p = Path(root)
+                    if not os.access(r_p, os.R_OK | os.X_OK):
+                        errors.append(f"Source permission error: Subdirectory '{r_p}' is not readable/traversable")
+                        rule_err_count += 1
+                        continue
+                    for f in files:
+                        f_p = r_p / f
+                        if not os.access(f_p, os.R_OK):
+                            errors.append(f"Source permission error: File '{f_p}' is not readable")
+                            rule_err_count += 1
+                            if rule_err_count >= 5:
+                                break
+
+    return errors
+
+def validate_task(task_name: str, task: dict):
+    errors = []
+    # Check mandatory fields
+    for field in ["destination", "keep_count", "schedule", "rules"]:
+        if field not in task or task[field] is None:
+            errors.append(f"Missing mandatory field '{field}'")
+
+    if "rules" in task:
+        if not isinstance(task["rules"], list) or len(task["rules"]) == 0:
+            errors.append("Field 'rules' must be a non-empty list of strings")
+        else:
+            for idx, r in enumerate(task["rules"]):
+                if not isinstance(r, str):
+                    errors.append(f"Rule #{idx+1} is not a string: {r}")
+                elif "->" not in r and len(r.split()) < 2:
+                    errors.append(f"Rule #{idx+1} syntax invalid. Use '<src> -> <dst>' or '<src> <dst>': {r}")
+
+    if "keep_count" in task:
+        try:
+            kc = int(task["keep_count"])
+            if kc <= 0:
+                errors.append(f"'keep_count' must be > 0 (got {kc})")
+        except (ValueError, TypeError):
+            errors.append(f"'keep_count' must be an integer (got {task['keep_count']})")
+
+    fmt = task.get("format", "dir")
+    if fmt not in ["dir", "tar.zst", "tar.gz"]:
+        errors.append(f"Invalid format '{fmt}'. Supported: 'dir', 'tar.zst', 'tar.gz'")
+
+    # Permission checks
+    perm_errors = check_permissions(task)
+    errors.extend(perm_errors)
+
+    return errors
+
+def cmd_template(args):
+    target = Path(args.path).expanduser().resolve()
+    if target.exists() and not args.force:
+        log(f"Error: Target file {target} already exists. Use --force to overwrite.", error=True)
+        return 1
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(TEMPLATE_CONTENT)
+    log(f"Template created successfully: {target}")
+    return 0
+
+def cmd_verify(args):
+    target = Path(args.path).expanduser().resolve()
+    try:
+        globals_dict, tasks = parse_config_file(target)
+    except Exception as e:
+        log(f"Verification FAILED: {e}", error=True)
+        return 1
+
+    if not tasks:
+        log(f"Warning: No backup tasks found in {target}", error=True)
+        return 1
+
+    has_errors = False
+    log(f"Verifying {target} ({len(tasks)} tasks)...")
+    for name, task in tasks.items():
+        errors = validate_task(name, task)
+        if errors:
+            has_errors = True
+            log(f"  [X] Task [{name}]:", error=True)
+            for err in errors:
+                log(f"      - {err}", error=True)
+        else:
+            log(f"  [OK] Task [{name}]")
+            log(f"      + Permissions on destination '{task['destination']}': OK")
+            for r in task["rules"]:
+                src, dst = parse_rule_line(r)
+                matches = glob.glob(src, recursive=True)
+                if not matches:
+                    log(f"      ! Warning: Pattern '{src}' matched 0 files/dirs right now.")
+                else:
+                    log(f"      + Rule '{src} -> {dst}': matches {len(matches)} item(s) (all readable)")
+
+    if has_errors:
+        log(f"Configuration {target} has errors.", error=True)
+        return 1
+    log(f"Configuration {target} is VALID.")
+    return 0
+
+def cmd_enable(args):
+    ensure_dirs()
+    target = Path(args.path).expanduser().resolve()
+    if not target.is_file():
+        log(f"Error: File {target} not found", error=True)
+        return 1
+
+    globals_dict, tasks = parse_config_file(target)
+    for name, task in tasks.items():
+        errs = validate_task(name, task)
+        if errs:
+            log(f"Error: Cannot enable {target} due to validation/permission errors:", error=True)
+            for e in errs:
+                log(f"  - {e}", error=True)
+            return 1
+
+    link_name = ENABLED_DIR / target.name
+    if link_name.exists() or link_name.is_symlink():
+        link_name.unlink()
+    link_name.symlink_to(target)
+    log(f"Enabled: {link_name} -> {target}")
+    return 0
+
+def cmd_disable(args):
+    ensure_dirs()
+    target_name = Path(args.path).name
+    if not target_name.endswith(".toml"):
+        target_name += ".toml"
+    link_path = ENABLED_DIR / target_name
+    if link_path.exists() or link_path.is_symlink():
+        link_path.unlink()
+        log(f"Disabled: {target_name}")
+        return 0
+    else:
+        log(f"Error: {target_name} is not currently enabled in {ENABLED_DIR}", error=True)
+        return 1
+
+def cmd_list(args):
+    ensure_dirs()
+    enabled_files = sorted(list(ENABLED_DIR.glob("*.toml")))
+    if not enabled_files:
+        log("No configs enabled. Use 'microback enable <path>' to enable a backup config.")
+        return 0
+
+    print(f"{'TASK':<22} {'SCHEDULE':<12} {'KEEP':<6} {'FORMAT':<8} {'DESTINATION':<32} {'CONFIG'}")
+    print("-" * 105)
+    for cfg in enabled_files:
+        try:
+            _, tasks = parse_config_file(cfg)
+            for name, task in tasks.items():
+                dest = task.get("destination", "-")
+                sched = task.get("schedule", "-")
+                keep = str(task.get("keep_count", "-"))
+                fmt = task.get("format", "dir")
+                cfg_path = str(cfg.resolve())
+                print(f"{name:<22} {sched:<12} {keep:<6} {fmt:<8} {dest:<32} {cfg_path}")
+        except Exception as e:
+            print(f"{cfg.name:<22} ERROR: {e}")
+    return 0
+
+def run_task(name: str, task: dict, dry_run: bool = False):
+    log(f"=== Starting backup task [{name}] ===")
+
+    # Permission verification at runtime
+    perm_errors = check_permissions(task)
+    if perm_errors:
+        log(f"Permission check FAILED for task [{name}]:", error=True)
+        for pe in perm_errors:
+            log(f"  - {pe}", error=True)
+        return False
+
+    dest_base = Path(task["destination"]).expanduser().resolve()
+    keep_count = int(task.get("keep_count", 7))
+    fmt = task.get("format", "dir")
+    verify_rule = task.get("verify")
+    rules = task["rules"]
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    target_snapshot = dest_base / timestamp
+    latest_symlink = dest_base / "latest"
+
+    # Pre-hook
+    pre_hook = task.get("pre_hook")
+    if pre_hook:
+        log(f"  -> Running pre_hook: {pre_hook}")
+        if not dry_run:
+            res = subprocess.run(pre_hook, shell=True, text=True)
+            if res.returncode != 0:
+                log(f"Error: pre_hook failed with code {res.returncode}. Aborting task.", error=True)
+                return False
+
+    if dry_run:
+        log(f"  [DRY-RUN] Snapshot directory would be: {target_snapshot}")
+        for r in rules:
+            src, dst = parse_rule_line(r)
+            matches = glob.glob(src, recursive=True)
+            log(f"  [DRY-RUN] Rule '{src} -> {dst}': {len(matches)} items matched")
+        return True
+
+    dest_base.mkdir(parents=True, exist_ok=True)
+
+    # Find previous backup for hardlinking if format == "dir"
+    prev_backup = None
+    if fmt == "dir":
+        existing_dirs = sorted([d for d in dest_base.iterdir() if d.is_dir() and not d.is_symlink()])
+        if existing_dirs:
+            prev_backup = existing_dirs[-1]
+            log(f"  -> Using hardlinks against previous snapshot: {prev_backup.name}")
+
+    target_snapshot.mkdir(parents=True, exist_ok=True)
+
+    total_files = 0
+    for r in rules:
+        src_pattern, dst_sub = parse_rule_line(r)
+        rule_dest = target_snapshot / dst_sub
+        rule_dest.mkdir(parents=True, exist_ok=True)
+
+        matches = glob.glob(src_pattern, recursive=True)
+        if not matches:
+            log(f"  ! Notice: No files matched for pattern '{src_pattern}'")
+            continue
+
+        log(f"  -> Copying '{src_pattern}' ({len(matches)} items) to {dst_sub}/")
+        for match in matches:
+            match_path = Path(match)
+            if fmt == "dir":
+                link_dest_arg = []
+                if prev_backup and (prev_backup / dst_sub).is_dir():
+                    link_dest_arg = [f"--link-dest={prev_backup / dst_sub}"]
+
+                cmd = ["rsync", "-aHAX", "--numeric-ids"] + link_dest_arg
+                if match_path.is_dir():
+                    cmd.append(f"{match_path}/")
+                    cmd.append(f"{rule_dest}/")
+                else:
+                    cmd.append(str(match_path))
+                    cmd.append(f"{rule_dest}/")
+
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if res.returncode != 0:
+                    log(f"Warning: rsync error on {match}: {res.stderr.strip()}", error=True)
+            total_files += 1
+
+    # Format tar.zst handling if requested
+    if fmt in ["tar.zst", "tar.gz"]:
+        archive_name = f"{timestamp}.{fmt}"
+        archive_path = dest_base / archive_name
+        log(f"  -> Compressing snapshot into {archive_name}...")
+        tar_cmd = ["tar", "-ca", "-f", str(archive_path), "-C", str(target_snapshot), "."]
+        subprocess.run(tar_cmd, check=True)
+        shutil.rmtree(target_snapshot)
+        target_snapshot = archive_path
+
+    # Verification
+    if verify_rule and str(verify_rule).lower() not in ["none", "null", "false", ""]:
+        log(f"  -> Verifying snapshot ({verify_rule})...")
+        if verify_rule == "not_empty":
+            sz = target_snapshot.stat().st_size if target_snapshot.is_file() else sum(f.stat().st_size for f in target_snapshot.rglob("*") if f.is_file())
+            if sz == 0:
+                log("Verification FAILED: Backup is empty (0 bytes)!", error=True)
+                return False
+        elif verify_rule.startswith("min_size:"):
+            limit_str = verify_rule.split(":", 1)[1].strip()
+            mult = 1
+            if limit_str.upper().endswith("K"): mult = 1024
+            elif limit_str.upper().endswith("M"): mult = 1024**2
+            elif limit_str.upper().endswith("G"): mult = 1024**3
+            limit_bytes = int(limit_str.rstrip("KMGTBkmgtb")) * mult
+            sz = target_snapshot.stat().st_size if target_snapshot.is_file() else sum(f.stat().st_size for f in target_snapshot.rglob("*") if f.is_file())
+            if sz < limit_bytes:
+                log(f"Verification FAILED: Size {sz} bytes is below threshold {limit_bytes} bytes!", error=True)
+                return False
+        elif verify_rule.startswith("cmd:"):
+            v_cmd = verify_rule.split(":", 1)[1].strip()
+            res = subprocess.run(v_cmd, shell=True, cwd=str(target_snapshot) if target_snapshot.is_dir() else str(dest_base))
+            if res.returncode != 0:
+                log(f"Verification FAILED: Custom command '{v_cmd}' returned code {res.returncode}", error=True)
+                return False
+
+    # Update latest symlink
+    if latest_symlink.exists() or latest_symlink.is_symlink():
+        latest_symlink.unlink()
+    try:
+        latest_symlink.symlink_to(target_snapshot.name)
+    except Exception:
+        pass
+
+    # Post-hook
+    post_hook = task.get("post_hook")
+    if post_hook:
+        log(f"  -> Running post_hook: {post_hook}")
+        subprocess.run(post_hook, shell=True)
+
+    # Retention / Rotation
+    all_snapshots = sorted([
+        item for item in dest_base.iterdir()
+        if (item.is_dir() and not item.is_symlink()) or (item.is_file() and (item.name.endswith(".tar.zst") or item.name.endswith(".tar.gz")))
+    ])
+    if len(all_snapshots) > keep_count:
+        to_delete = all_snapshots[:-keep_count]
+        log(f"  -> Retention: keeping {keep_count} latest, removing {len(to_delete)} old snapshot(s)...")
+        for old in to_delete:
+            log(f"     - Removing old backup: {old.name}")
+            if old.is_dir():
+                shutil.rmtree(old, ignore_errors=True)
+            else:
+                old.unlink(missing_ok=True)
+
+    log(f"=== Task [{name}] completed successfully: {target_snapshot} ===")
+    return True
+
+def cmd_sync(args):
+    ensure_dirs()
+    target_tasks = []
+
+    if args.config:
+        cfg_path = Path(args.config).expanduser().resolve()
+        _, tasks = parse_config_file(cfg_path)
+        if args.task:
+            if args.task in tasks:
+                target_tasks.append((args.task, tasks[args.task]))
+            else:
+                log(f"Error: Task '{args.task}' not found in {cfg_path}", error=True)
+                return 1
+        else:
+            target_tasks.extend(tasks.items())
+    else:
+        enabled_files = sorted(list(ENABLED_DIR.glob("*.toml")))
+        if not enabled_files:
+            log("No configs enabled in /etc/microback/enabled.d. Nothing to sync.")
+            return 0
+        for cfg in enabled_files:
+            try:
+                _, tasks = parse_config_file(cfg)
+                if args.task:
+                    if args.task in tasks:
+                        target_tasks.append((args.task, tasks[args.task]))
+                else:
+                    target_tasks.extend(tasks.items())
+            except Exception as e:
+                log(f"Error loading {cfg}: {e}", error=True)
+
+    if not target_tasks:
+        if args.task:
+            log(f"Error: Task '{args.task}' not found in any enabled configuration", error=True)
+            return 1
+        log("No tasks found to run.")
+        return 0
+
+    all_success = True
+    for name, task in target_tasks:
+        success = run_task(name, task, dry_run=args.dry_run)
+        if not success:
+            all_success = False
+
+    return 0 if all_success else 1
+
+def cmd_cron(args):
+    ensure_dirs()
+    enabled_files = sorted(list(ENABLED_DIR.glob("*.toml")))
+    now = datetime.datetime.now()
+    current_hhmm = now.strftime("%H:%M")
+
+    for cfg in enabled_files:
+        try:
+            _, tasks = parse_config_file(cfg)
+            for name, task in tasks.items():
+                schedule = str(task.get("schedule", "")).strip()
+                if not schedule:
+                    continue
+
+                is_due = False
+                state_file = STATE_DIR / f"{name}.last"
+
+                if schedule == current_hhmm:
+                    if state_file.exists():
+                        last_run = state_file.read_text().strip()
+                        if last_run == now.strftime("%Y-%m-%d"):
+                            continue
+                    is_due = True
+                elif schedule.startswith("every "):
+                    val_str = schedule.replace("every ", "").strip()
+                    secs = 3600
+                    if val_str.endswith("h"): secs = int(val_str[:-1]) * 3600
+                    elif val_str.endswith("m"): secs = int(val_str[:-1]) * 60
+                    elif val_str.endswith("d"): secs = int(val_str[:-1]) * 86400
+
+                    if state_file.exists():
+                        try:
+                            last_ts = float(state_file.read_text().strip())
+                            if (now.timestamp() - last_ts) >= secs:
+                                is_due = True
+                        except Exception:
+                            is_due = True
+                    else:
+                        is_due = True
+
+                if is_due:
+                    log(f"Schedule triggered for [{name}] ({schedule})")
+                    ok = run_task(name, task)
+                    if ok:
+                        if schedule == current_hhmm:
+                            state_file.write_text(now.strftime("%Y-%m-%d"))
+                        else:
+                            state_file.write_text(str(now.timestamp()))
+        except Exception as e:
+            log(f"Error checking schedule for {cfg}: {e}", error=True)
+    return 0
+
+def cmd_install_cron(args):
+    cron_file = Path("/etc/cron.d/microback")
+    cron_file.parent.mkdir(parents=True, exist_ok=True)
+    bin_path = shutil.which("microback") or "/usr/local/bin/microback"
+    cron_content = f"# Run microback scheduled tasks every minute\n* * * * * root {bin_path} cron >> /var/log/microback/cron.log 2>&1\n"
+    cron_file.write_text(cron_content)
+    log(f"Cron schedule installed: {cron_file}")
+    return 0
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="microback",
+        description="Lightweight backup tool with hardlinks, rotation and TOML config."
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    p_template = subparsers.add_parser("template", help="Generate a new commented configuration template")
+    p_template.add_argument("path", help="Destination path for the template file")
+    p_template.add_argument("-f", "--force", action="store_true", help="Overwrite existing file")
+
+    p_verify = subparsers.add_parser("verify", help="Validate configuration syntax, rule paths and permissions")
+    p_verify.add_argument("path", help="Path to config file to verify")
+
+    for cmd in ["enable", "on"]:
+        p_enable = subparsers.add_parser(cmd, help="Enable configuration file")
+        p_enable.add_argument("path", help="Path to config file to enable")
+
+    for cmd in ["disable", "off"]:
+        p_disable = subparsers.add_parser(cmd, help="Disable configuration file")
+        p_disable.add_argument("path", help="Name or path of config file to disable")
+
+    subparsers.add_parser("list", help="List all enabled configurations and tasks")
+
+    for cmd in ["sync", "run"]:
+        p_sync = subparsers.add_parser(cmd, help="Execute backup sync immediately")
+        p_sync.add_argument("task", nargs="?", help="Optional specific task name to run")
+        p_sync.add_argument("-c", "--config", help="Run directly from a specific config file")
+        p_sync.add_argument("--dry-run", action="store_true", help="Simulate backup without copying")
+
+    subparsers.add_parser("cron", help="Internal schedule checker (run by cron or timer)")
+    subparsers.add_parser("install-cron", help="Install /etc/cron.d/microback runner")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    if args.command == "template":
+        return cmd_template(args)
+    elif args.command == "verify":
+        return cmd_verify(args)
+    elif args.command in ["enable", "on"]:
+        return cmd_enable(args)
+    elif args.command in ["disable", "off"]:
+        return cmd_disable(args)
+    elif args.command == "list":
+        return cmd_list(args)
+    elif args.command in ["sync", "run"]:
+        return cmd_sync(args)
+    elif args.command == "cron":
+        return cmd_cron(args)
+    elif args.command == "install-cron":
+        return cmd_install_cron(args)
+
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,37 @@
+# microback configuration example
+# Global defaults applied to all tasks in this file (can be overridden in tasks)
+destination = "/big/backups"
+keep_count = 7
+format = "dir"        # "dir" (uses rsync hardlinks), "tar.zst", or "tar.gz"
+verify = null         # null / "none", "size>10M", or "cmd:test -f marker.txt"
+schedule = "03:00"    # Run daily at 03:00 (also supports "1d", "12h", "60m", cron syntax)
+
+[minecraft_pokemon]
+destination = "/big/backups/pokemon"
+keep_count = 14
+schedule = "04:00"
+format = "dir"
+verify = null
+
+# Backup rules: "<source mask/path> -> <destination subfolder>"
+# (space-separated "<source> <destination>" is also supported)
+rules = [
+    "~/minecraft_pokemon/data/world/playerdata -> playerdata",
+    "~/minecraft_pokemon/data/world/data/pokemon/pc/* -> pc",
+    "~/minecraft_pokemon/server.properties -> config",
+]
+
+# Optional lifecycle hooks:
+# pre_hook = "docker exec mc_pokemon rcon-cli save-off && docker exec mc_pokemon rcon-cli save-all"
+# post_hook = "docker exec mc_pokemon rcon-cli save-on"
+
+[vault_backup]
+destination = "/big/backups/vault"
+schedule = "02:00"
+keep_count = 30
+format = "tar.zst"
+verify = "size>1M"
+
+rules = [
+    "/opt/syncthing/vault -> vault",
+]
