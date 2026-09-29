@@ -7,12 +7,13 @@
 
 Minimalist, zero-dependency local backup manager inspired by `microsocks` simplicity and `caddy`-style ergonomics.
 
-Built entirely with standard Python 3.12+ (`tomllib`, `argparse`, `shutil`, `rsync`). No pip packages required.
+Built with standard Python 3.8+ (`tomllib`/`tomli` or built-in zero-dependency TOML parser fallback, `argparse`, `shutil`, `rsync`). No pip packages required.
 
 ---
 
 ## Features
 
+- **Broad Python Compatibility (3.8 - 3.13+)**: Zero external dependencies out-of-the-box. Uses `tomllib` on 3.11+, with seamless built-in fallback parser on older Pythons (Ubuntu 20.04/22.04 LTS).
 - **Hardlink Snapshots (`format = "dir"`)**: Every backup looks like a full directory tree, but files unchanged from the previous backup are hardlinked (`--link-dest`), consuming zero extra disk space.
 - **Archive Formats (`tar.zst`, `tar.gz`)**: Optional streaming compression for cold archives.
 - **Deep Permission Checking**: Verifies read and traversal permissions recursively across all matched folders, subfolders, and files, plus write and traversal access to destination storage.
@@ -25,7 +26,7 @@ Built entirely with standard Python 3.12+ (`tomllib`, `argparse`, `shutil`, `rsy
 
 ## Installation
 
-Requires Linux with Python 3.12+ and `rsync`.
+Requires Linux with Python 3.8+ and `rsync`.
 
 ```bash
 # Clone or copy microback

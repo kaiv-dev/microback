@@ -10,10 +10,20 @@ import shutil
 import subprocess
 import argparse
 import datetime
-import tomllib
 import re
 import getpass
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        try:
+            import toml as tomllib
+        except ModuleNotFoundError:
+            tomllib = None
 
 ENABLED_DIR = Path("/etc/microback/enabled.d")
 LOG_DIR = Path("/var/log/microback")
@@ -62,6 +72,114 @@ def ensure_dirs():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+def parse_scalar_value(v: str):
+    v = v.strip()
+    if not v:
+        return ""
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        quote = v[0]
+        inner_str = v[1:-1]
+        if quote == '"':
+            try:
+                inner_str = inner_str.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+        return inner_str
+    if v.lower() in ("null", "none"):
+        return None
+    if v.lower() == "true":
+        return True
+    if v.lower() == "false":
+        return False
+    if re.match(r"^-?\d+$", v):
+        return int(v)
+    if re.match(r"^-?\d+\.\d+$", v):
+        return float(v)
+    return v
+
+def parse_list(inner: str) -> list:
+    items = []
+    current = []
+    in_quote = None
+    escaped = False
+
+    for ch in inner:
+        if escaped:
+            current.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            current.append(ch)
+            continue
+        if ch in ('"', "'"):
+            if in_quote is None:
+                in_quote = ch
+            elif in_quote == ch:
+                in_quote = None
+            current.append(ch)
+            continue
+        if ch == "," and in_quote is None:
+            raw = "".join(current).strip()
+            if raw:
+                items.append(parse_scalar_value(raw))
+            current = []
+            continue
+        current.append(ch)
+
+    raw = "".join(current).strip()
+    if raw:
+        items.append(parse_scalar_value(raw))
+    return items
+
+def parse_mini_toml(text: str) -> dict:
+    data = {}
+    current_section = data
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw_line = lines[i]
+        i += 1
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        # Section header: [section_name]
+        m_sec = re.match(r"^\[([A-Za-z0-9_.-]+)\]\s*(?:#.*)?$", line)
+        if m_sec:
+            sec_name = m_sec.group(1)
+            current_section = {}
+            data[sec_name] = current_section
+            continue
+
+        # Key-value pair: key = value
+        if "=" in line:
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+
+            # Handle multi-line lists: [ ...
+            first_v_no_comment = re.split(r"#(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", v)[0].strip()
+            if first_v_no_comment.startswith("[") and not first_v_no_comment.endswith("]"):
+                accum = [first_v_no_comment]
+                while i < len(lines):
+                    next_line = lines[i].strip()
+                    i += 1
+                    clean_sub = re.split(r"#(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", next_line)[0].strip()
+                    accum.append(clean_sub)
+                    if "]" in clean_sub:
+                        break
+                v = " ".join(accum)
+            else:
+                v = re.split(r"#(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", v)[0].strip()
+
+            if v.startswith("[") and v.endswith("]"):
+                current_section[k] = parse_list(v[1:-1].strip())
+            else:
+                current_section[k] = parse_scalar_value(v)
+
+    return data
+
 def parse_config_file(path: Path):
     if not path.is_file():
         raise FileNotFoundError(f"Configuration file not found: {path}")
@@ -69,10 +187,22 @@ def parse_config_file(path: Path):
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    try:
-        data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError as e:
-        raise ValueError(f"TOML Syntax Error in {path}: {e}")
+    data = None
+    if tomllib is not None:
+        try:
+            safe_content = re.sub(r'=\s*null\b', '= "none"', content)
+            if hasattr(tomllib, "loads"):
+                data = tomllib.loads(safe_content)
+            elif hasattr(tomllib, "parse"):
+                data = tomllib.parse(safe_content)
+        except Exception:
+            data = None
+
+    if data is None:
+        try:
+            data = parse_mini_toml(content)
+        except Exception as e:
+            raise ValueError(f"Config Syntax Error in {path}: {e}")
 
     # Extract globals (root-level scalar keys or [default] / [defaults])
     globals_dict = {
